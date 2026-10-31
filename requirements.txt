@@ -3,3 +3,4 @@ pandas>=2.2
 numpy>=1.26
 plotly>=5.24
 ccxt>=4.4
+requests>=2.31

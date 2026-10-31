@@ -8,21 +8,24 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from desk import data as D
-from desk.backtest import Costs, grid_search, run, stats
-from desk.indicators import resample_ohlc
-from desk.regime import describe
-from desk.risk import build_ticket
-from desk.signals import Params, build, live_factors, verdict
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import engine as D  # noqa: E402
+from engine import (Costs, Params, build, build_ticket, describe, grid_search,  # noqa: E402
+                    live_factors, resample_ohlc, run, stats, verdict)
 
 st.set_page_config(page_title="BTC Perp Desk", page_icon="📈", layout="wide")
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.header("Data")
-    source = st.radio("Source", ["Live exchange", "Demo (synthetic)"], index=1,
-                      help="Demo mode needs no internet. Live mode uses public exchange endpoints, no API key.")
-    exchange = st.selectbox("Exchange", list(D.EXCHANGES), disabled=source != "Live exchange")
+    source = st.radio("Source", ["Live exchange", "Demo (synthetic)"], index=0,
+                      help="Live mode public exchange endpoints use karta hai, API key nahi chahiye. Demo nakli data hai.")
+    exchange = st.selectbox("Exchange", ["Auto"] + D.SOURCES, disabled=source != "Live exchange",
+                            help="Auto: Hyperliquid, phir OKX, Bybit, Binance. Jo pehle chale wahi use hota hai.")
     tf = st.selectbox("Timeframe", ["1h", "4h", "1d"], index=1)
     candles = st.slider("Candles", 800, 5000, 3000, step=100)
 
@@ -61,28 +64,41 @@ def load(source: str, exchange: str, tf: str, candles: int):
     if source.startswith("Demo"):
         df, fund, fl, oi = D.synthetic(tf, max(candles, 3500), seed=7)
         daily = resample_ohlc(df, "1D") if tf != "1d" else df
-        return df.tail(candles), daily, fund, fl, oi, None
-    ex = D.EXCHANGES[exchange]
+        return {"df": df.tail(candles), "daily": daily, "fund": fund, "fund_last": fl, "oi": oi, "oi_src": "demo",
+                "price": float(df["close"].iloc[-1]), "source": "Demo", "errors": []}, None
     try:
-        df = D.fetch_ohlcv(ex, tf, candles)
-        daily = D.fetch_ohlcv(ex, "1d", 400) if tf != "1d" else df
-        fund = D.fetch_funding(ex)
-        oi = D.fetch_oi_change(ex)
-        fl = float(fund.iloc[-1]) if fund is not None and len(fund) else None
-        return df, daily, fund, fl, oi, None
-    except Exception as e:  # network blocked, geo restriction, rate limit
-        return None, None, None, None, None, f"{type(e).__name__}: {e}"
+        return D.fetch_live(tf, candles, exchange), None
+    except Exception as e:  # every venue failed: network blocked, geo restriction, rate limit
+        return None, str(e)
 
 
-df, daily, fund, fund_last, oi_chg, err = load(source, exchange, tf, candles)
+data, err = load(source, exchange, tf, candles)
 
 st.title("BTC Perp Desk")
-if err or df is None:
-    st.error(f"Live data nahi mila ({err}). Dusra exchange try karo, ya sidebar mein Demo mode chuno. "
-             "Binance kuch regions mein block hota hai, Bybit ya OKX try karo.")
+if err or data is None:
+    st.error("Live data kisi bhi exchange se nahi aaya.")
+    st.code(err or "unknown error")
+    st.info("Thodi der baad Refresh karo, ya Exchange dropdown mein ek ek karke try karo. "
+            "Tool samajhne ke liye sidebar mein Demo mode chuno.")
     st.stop()
+
+df, daily, fund = data["df"], data["daily"], data["fund"]
+fund_last, oi_chg, live_price = data["fund_last"], data["oi"], data["price"]
 if source.startswith("Demo"):
     st.warning("Demo mode: ye nakli (synthetic) data hai. Isse real trade decision mat lo. Sirf tool samajhne ke liye.")
+else:
+    st.caption(f"Data source: **{data['source']}** (candles + funding), OI: {data['oi_src'] or 'nahi mila'}. "
+               "Har 60 second mein refresh hota hai.")
+    if data["errors"]:
+        with st.expander("Pehle ke exchanges jo fail hue"):
+            st.write("\n".join(data["errors"]))
+with st.sidebar.expander("Manual override (agar feed na mile)"):
+    mf = st.number_input("Funding % per 8h", -0.5, 0.5, 0.0, 0.001, format="%.3f")
+    use_mf = st.checkbox("Funding manual use karo", False)
+    mo = st.number_input("OI 24h change %", -50.0, 50.0, 0.0, 0.5)
+    use_mo = st.checkbox("OI manual use karo", False)
+    if use_mf: fund_last = mf / 100
+    if use_mo: oi_chg = mo
 if len(df) < 600:
     st.error("Kam candles hain. Candles slider badhao.")
     st.stop()
@@ -103,7 +119,7 @@ with tab_live:
     colour = {"LONG": "green", "SHORT": "red", "NO TRADE": "orange"}[v]
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("BTC", f"{last['close']:,.0f}", f"{(last['close']/d['close'].iloc[-7]-1)*100:+.1f}% / 6 bars")
+    c1.metric("BTC live", f"{live_price:,.0f}", f"{(live_price/d['close'].iloc[-7]-1)*100:+.1f}% / 6 bars")
     c2.metric("Regime", last["regime"])
     c3.metric("ADX | ATR%", f"{last['adx']:.0f} | {last['atr_pct']:.1f}%")
     c4.metric("Score", f"{score:+.1f}", help="LONG: +3 ya zyada, SHORT: -3 ya kam, aur daily trend saath ho.")
@@ -134,7 +150,7 @@ with tab_live:
                 st.caption("Score hai par daily trend ke against hai, isliye skip.")
         else:
             mult = 0.5 if (news_day or weekend) else 1.0
-            t = build_ticket(v, float(last["close"]), float(last["ema_fast"]), float(last["atr"]), capital,
+            t = build_ticket(v, float(live_price), float(last["ema_fast"]), float(last["atr"]), capital,
                              risk_pct, max_lev, p.stop_atr, p.rr, mult)
             if last["high_vol"]:
                 st.warning("Volatility bahut high hai. Size aadha karne ka socho.")
